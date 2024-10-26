@@ -17,7 +17,7 @@ class BallTracker:
         # Initialize Picamera2
         self.picam2 = Picamera2()
         camera_config = self.picam2.create_preview_configuration(
-            main={"size": (1920, 1080)}
+            main={"size": (1080, 1080)}
         )
         self.picam2.configure(camera_config)
         self.picam2.start()
@@ -31,7 +31,7 @@ class BallTracker:
         self.position_history = deque(maxlen=5)  # Store the last 5 positions
 
         # Set visual display option
-        self.visual_display = True  # Toggle visual display on/off
+        self.visual_display = False  # Toggle visual display on/off
 
     def detect_ball(self, frame):
         """Detect the red ball using color segmentation."""
@@ -113,7 +113,7 @@ class BallTracker:
             # Display the frame if visual display is enabled
             if self.visual_display:
                 cv2.namedWindow("Ball Tracker", cv2.WINDOW_NORMAL)  # Allow resizing
-                cv2.resizeWindow("Ball Tracker", 1280, 720)
+                cv2.resizeWindow("Ball Tracker", 960, 960)
                 cv2.imshow("Ball Tracker", processed_frame)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
