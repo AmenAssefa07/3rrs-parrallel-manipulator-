@@ -44,7 +44,7 @@ def calculate_theta_for_motor(alpha, beta, z_height, motor_id):
 
     phi = math.atan2(B, A)
     theta = math.asin(C / D) + phi
-
+    
     rospy.loginfo(f"Motor {motor_id} - Theta: {math.degrees(theta):.2f}, Height: {h_adjusted:.2f}")
     return -math.degrees(theta)
 
@@ -64,7 +64,8 @@ def theta_to_pwm(thetas):
 
 def update_motors(data):
     """Callback to update motors based on the desired orientation."""
-    alpha, beta, z_height = data.data
+    beta, alpha, z_height = data.data
+    print("recived data (a,b,z): ", alpha, beta, z_height)
     thetas = [calculate_theta_for_motor(alpha, beta, z_height, i) for i in range(3)]
     pwm_values = theta_to_pwm(thetas)
 
