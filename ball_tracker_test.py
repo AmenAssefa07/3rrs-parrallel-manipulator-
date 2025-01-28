@@ -9,10 +9,10 @@ class BallTracker:
     def __init__(self):
         rospy.init_node('ball_tracker', log_level=rospy.INFO)
         
-        # Toggle visual display
-        self.visual_display = True  # Set to False to disable GUI
+        # Visual debug toggle
+        self.visual_display = True  # Change to False to disable GUI
         
-        # Camera configuration
+        # Camera setup for max performance
         self.resolution = (640, 480)
         self.camera = Picamera2()
         config = self.camera.create_video_configuration(
@@ -66,7 +66,7 @@ class BallTracker:
         while not rospy.is_shutdown():
             frame = self.camera.capture_array()
             current_time = rospy.Time.now()
-            debug_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR) if self.visual_display else None
+            processed_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR) if self.visual_display else None
             
             detection = self._detect_ball(frame)
             
@@ -91,22 +91,24 @@ class BallTracker:
                 self.pub.publish(msg)
 
                 if self.visual_display:
-                    cv2.circle(debug_frame, (int(state[0][0]), int(state[1][0])), 
+                    # Draw tracking visuals
+                    cv2.circle(processed_frame, (int(state[0][0]), int(state[1][0])), 
                               5, (0, 255, 0), -1)
-                    cv2.putText(debug_frame, 
-                              f"Speed: {speed:.1f}px/s", 
-                              (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
-                              0.7, (255, 255, 255), 2)
+                    text = f"Pos: ({state[0][0]:.1f}, {state[1][0]:.1f}), Vel: ({vx:.2f}, {vy:.2f})"
+                    cv2.putText(processed_frame, text, (10, 30), 
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
             else:
                 self._init_kalman()
                 self.prev_pos = None
 
             if self.visual_display:
+                # Display window
                 cv2.namedWindow("Ball Tracker", cv2.WINDOW_NORMAL)
-                cv2.resizeWindow("Ball Tracker", 960, 960)
-                cv2.imshow("Ball Tracker", debug_frame)
+                cv2.resizeWindow("Ball Tracker", 700, 700)
+                cv2.imshow("Ball Tracker", processed_frame)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
+                    rospy.loginfo("Exiting visual display.")
                     break
 
         cv2.destroyAllWindows()
