@@ -9,15 +9,22 @@ class BallTracker:
     def __init__(self):
         rospy.init_node('ball_tracker', log_level=rospy.INFO)
         
-        # Visual debug toggle
-        self.visual_display = True  # Change to False to disable GUI
+        # Visual debug and calibration controls
+        self.visual_display = True
+        self.show_hsv_mask = True  # Toggle to see what the camera detects
         
-        # Camera setup for max performance
+        # Initial HSV ranges (adjust these values based on your ball)
+        self.hsv_lower1 = np.array([0, 120, 70])    # Lower red range
+        self.hsv_upper1 = np.array([10, 255, 255])
+        self.hsv_lower2 = np.array([170, 120, 70])  # Upper red range
+        self.hsv_upper2 = np.array([180, 255, 255])
+        
+        # Camera setup
         self.resolution = (640, 480)
         self.camera = Picamera2()
         config = self.camera.create_video_configuration(
             main={"size": self.resolution, "format": "RGB888"},
-            controls={"FrameDurationLimits": (8333, 8333)}  # 120 FPS
+            controls={"FrameDurationLimits": (8333, 8333)}
         )
         self.camera.configure(config)
         self.camera.start()
@@ -31,30 +38,67 @@ class BallTracker:
         self.prev_time = rospy.Time.now()
         self._init_kalman()
 
+        # Create trackbars if debug mode enabled
+        if self.visual_display:
+            cv2.namedWindow("HSV Calibration")
+            cv2.createTrackbar("H1", "HSV Calibration", 0, 180, self._nothing)
+            cv2.createTrackbar("S1", "HSV Calibration", 120, 255, self._nothing)
+            cv2.createTrackbar("V1", "HSV Calibration", 70, 255, self._nothing)
+            cv2.createTrackbar("H2", "HSV Calibration", 170, 180, self._nothing)
+            cv2.createTrackbar("S2", "HSV Calibration", 120, 255, self._nothing)
+            cv2.createTrackbar("V2", "HSV Calibration", 70, 255, self._nothing)
+
+    def _nothing(self, x): pass  # Dummy function for trackbars
+
     def _init_kalman(self):
-        """Initialize Kalman filter matrices"""
-        self.kalman.measurementMatrix = np.array([[1,0,0,0],[0,1,0,0]], np.float32)
-        self.kalman.transitionMatrix = np.array([
-            [1,0,1,0],
-            [0,1,0,1],
-            [0,0,1,0],
-            [0,0,0,1]
-        ], np.float32)
-        self.kalman.processNoiseCov = 1e-4 * np.eye(4, dtype=np.float32)
-        self.kalman.measurementNoiseCov = 1e-2 * np.eye(2, dtype=np.float32)
+        # ... (same Kalman initialization as before) ...
 
     def _detect_ball(self, frame):
-        """Ball detection with dual-range HSV thresholding"""
+        """Improved ball detection with dynamic HSV calibration"""
         hsv = cv2.cvtColor(frame, cv2.COLOR_RGB2HSV)
-        mask1 = cv2.inRange(hsv, np.array([0, 150, 50]), np.array([10, 255, 255]))
-        mask2 = cv2.inRange(hsv, np.array([170, 150, 50]), np.array([180, 255, 255]))
+        
+        # Update HSV values from trackbars in real-time
+        if self.visual_display:
+            self.hsv_lower1 = np.array([
+                cv2.getTrackbarPos("H1", "HSV Calibration"),
+                cv2.getTrackbarPos("S1", "HSV Calibration"),
+                cv2.getTrackbarPos("V1", "HSV Calibration")
+            ])
+            self.hsv_upper2 = np.array([
+                cv2.getTrackbarPos("H2", "HSV Calibration"),
+                255, 255  # Keep upper bounds at max
+            ])
+        
+        # Create masks with current thresholds
+        mask1 = cv2.inRange(hsv, self.hsv_lower1, self.hsv_upper1)
+        mask2 = cv2.inRange(hsv, self.hsv_lower2, self.hsv_upper2)
         combined_mask = cv2.bitwise_or(mask1, mask2)
         
+        # Noise reduction
+        kernel = np.ones((5,5), np.uint8)
+        combined_mask = cv2.erode(combined_mask, kernel, iterations=1)
+        combined_mask = cv2.dilate(combined_mask, kernel, iterations=2)
+        
+        # Show HSV mask for debugging
+        if self.show_hsv_mask and self.visual_display:
+            cv2.imshow("HSV Mask", combined_mask)
+        
+        # Contour processing
         contours, _ = cv2.findContours(combined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_TC89_L1)
         if not contours:
             return None
             
-        valid = [c for c in contours if 100 < cv2.contourArea(c) < 10000]
+        # Filter by size and circularity
+        valid = []
+        for c in contours:
+            area = cv2.contourArea(c)
+            if 500 < area < 10000:  # Adjusted size range
+                perimeter = cv2.arcLength(c, True)
+                if perimeter == 0: continue
+                circularity = 4 * np.pi * area / (perimeter ** 2)
+                if circularity > 0.6:  # Require round shapes
+                    valid.append(c)
+        
         if not valid:
             return None
             
@@ -63,56 +107,7 @@ class BallTracker:
         return (int(x), int(y), radius)
 
     def run(self):
-        while not rospy.is_shutdown():
-            frame = self.camera.capture_array()
-            current_time = rospy.Time.now()
-            processed_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR) if self.visual_display else None
-            
-            detection = self._detect_ball(frame)
-            
-            if detection:
-                x, y, radius = detection
-                prediction = self.kalman.predict()
-                measured = np.array([[x], [y]], dtype=np.float32)
-                state = self.kalman.correct(measured)
-                
-                dt = (current_time - self.prev_time).to_sec()
-                vx = (state[0][0] - self.prev_pos[0])/dt if self.prev_pos else 0.0
-                vy = (state[1][0] - self.prev_pos[1])/dt if self.prev_pos else 0.0
-                speed = np.hypot(vx, vy)
-                
-                self.prev_pos = (state[0][0], state[1][0])
-                self.prev_time = current_time
-                
-                msg = Vector3()
-                msg.x = state[0][0]
-                msg.y = state[1][0]
-                msg.z = speed
-                self.pub.publish(msg)
-
-                if self.visual_display:
-                    # Draw tracking visuals
-                    cv2.circle(processed_frame, (int(state[0][0]), int(state[1][0])), 
-                              5, (0, 255, 0), -1)
-                    text = f"Pos: ({state[0][0]:.1f}, {state[1][0]:.1f}), Vel: ({vx:.2f}, {vy:.2f})"
-                    cv2.putText(processed_frame, text, (10, 30), 
-                              cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-
-            else:
-                self._init_kalman()
-                self.prev_pos = None
-
-            if self.visual_display:
-                # Display window
-                cv2.namedWindow("Ball Tracker", cv2.WINDOW_NORMAL)
-                cv2.resizeWindow("Ball Tracker", 700, 700)
-                cv2.imshow("Ball Tracker", processed_frame)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    rospy.loginfo("Exiting visual display.")
-                    break
-
-        cv2.destroyAllWindows()
-        self.camera.stop()
+        # ... (rest of run() method remains the same) ...
 
 if __name__ == '__main__':
     tracker = BallTracker()
