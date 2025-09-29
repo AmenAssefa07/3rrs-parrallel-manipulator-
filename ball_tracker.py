@@ -1,17 +1,26 @@
 #!/usr/bin/env python3
 # TODOs (known issues not yet fixed):
 # 1) NoIR camera white balance / color gains not handled (colors can drift). Consider setting AwbMode/ColourGains.
-# 2) Log spam: "No ball detected" every cycle. Use rospy.logwarn_throttle to reduce noise.
-# 3) OpenCV window is created/resized every frame. Create once before the loop for efficiency.
-# 4) Camera is not explicitly stopped on shutdown. Add self.picam2.stop() in a finally/on_shutdown.
-# 5) Velocity can spike on tiny dt / jitter. Add dt floor and/or smooth vx, vy.
-# 6) Using Vector3 with speed in z is ambiguous. Consider publishing separate position/velocity topics or a custom msg.
-# 7) No morphological cleanup on mask. Add OPEN/CLOSE to reduce speckles/holes.
-# 8) Fixed radius threshold may fail at different scales. Consider area/circularity checks or adaptive thresholds.
-# 9) Frame rate request may not be honored as-is. Verify with proper sensor mode / FrameDurationLimits.
-# 10) No warm-up after camera start for AWB/exposure. Sleep briefly so stats settle.
-# 11) apply_moving_average casts via int(), which floors. Consider round() for less bias.
-# 12) Robustness: guard against None/invalid frames from capture_array().
+# 2) Camera is not explicitly stopped on shutdown. Add self.picam2.stop() in a finally/on_shutdown.
+# 3) Velocity can spike on tiny dt / jitter. Add a dt floor and/or smooth vx, vy.
+# 4) Using Vector3 with speed in z is ambiguous. Consider publishing separate position/velocity topics or a custom msg.
+# 5) No morphological cleanup on mask. Add OPEN/CLOSE to reduce speckles/holes.
+# 6) Fixed radius threshold may fail at different scales. Consider area/circularity checks or adaptive thresholds.
+# 7) Requested frame rate may not be honored as-is. Verify with proper sensor mode / FrameDurationLimits.
+# 8) No warm-up after camera start for AWB/exposure. Sleep briefly so stats settle.
+# 9) apply_moving_average casts via int(), which floors. Consider round() for less bias.
+# 10) Robustness: guard against None/invalid frames from capture_array().
+# 11) (Optional future) Restrict search to ROI near last known position to cut latency.
+# 12) (Optional future) Use RETR_EXTERNAL for contours; current RETR_TREE is unnecessary.
+# 13) (Optional future) Consider async capture / producer-consumer to reduce blocking latency.
+
+# CURRENT VERSION (v0.2) — changes from previous:
+# - Color pipeline: Removed redundant conversions. We now convert RGB->HSV for detection.
+#   Only when visual_display is True do we convert RGB->BGR for imshow/overlay.
+# - Window management: Create & size the OpenCV window once (before the loop) if display is enabled.
+# - Resolution: Dropped main stream to 640x640 to reduce per-frame processing cost.
+# - Logging: "No ball detected" is throttled to once every 0.5 seconds.
+# - (Kept) Two-range HSV mask for red hue wraparound.
 
 import rospy
 import cv2
@@ -30,8 +39,9 @@ class BallTracker:
         # Initialize Picamera2 with error handling
         self.picam2 = Picamera2()
         try:
+            # Fix #3: reduce resolution to 640x640
             camera_config = self.picam2.create_preview_configuration(
-                main={"size": (1000, 1000)},
+                main={"size": (640, 640)},
                 controls={"FrameRate": 120}
             )
             self.picam2.configure(camera_config)
@@ -50,18 +60,25 @@ class BallTracker:
         self.visual_display = False  # Toggle to enable/disable display
         rospy.loginfo(f"Display: {self.visual_display}")
 
-    def detect_ball(self, frame_bgr):
-        """Detect the ball using HSV color segmentation (two red ranges wrapping hue seam)."""
-        hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+        # Fix #2: if displaying, create/size window once (not every frame)
+        if self.visual_display:
+            cv2.namedWindow("Ball Tracker", cv2.WINDOW_NORMAL)  # Allow resizing
+            cv2.resizeWindow("Ball Tracker", 700, 700)
 
-        # Two-range red mask (example defaults; tune for your lighting/camera)
+    def detect_ball(self, hsv_frame, display_frame_for_return):
+        """
+        Detect the ball using HSV color segmentation (two red ranges wrapping hue seam).
+        hsv_frame: HSV image (converted from RGB outside).
+        display_frame_for_return: the frame we'll return for drawing (BGR if displaying, else RGB).
+        """
+        # Two-range red mask (tune for your lighting/camera)
         lower1 = np.array([0, 120, 80], dtype=np.uint8)
         upper1 = np.array([10, 255, 255], dtype=np.uint8)
         lower2 = np.array([170, 120, 80], dtype=np.uint8)
         upper2 = np.array([180, 255, 255], dtype=np.uint8)
 
-        mask1 = cv2.inRange(hsv, lower1, upper1)
-        mask2 = cv2.inRange(hsv, lower2, upper2)
+        mask1 = cv2.inRange(hsv_frame, lower1, upper1)
+        mask2 = cv2.inRange(hsv_frame, lower2, upper2)
         mask = cv2.bitwise_or(mask1, mask2)
 
         contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
@@ -70,9 +87,11 @@ class BallTracker:
             (x, y), radius = cv2.minEnclosingCircle(c)
             if radius > 10:
                 # rospy.loginfo(f"Ball detected at: {int(x)}, {int(y)} with radius: {radius}")
-                return (int(x), int(y)), frame_bgr
-        rospy.logwarn("No ball detected.")
-        return None, frame_bgr
+                return (int(x), int(y)), display_frame_for_return
+
+        # Fix #4: throttle logs to once per 0.5 seconds
+        rospy.logwarn_throttle(0.5, "No ball detected.")
+        return None, display_frame_for_return
 
     def apply_moving_average(self, position):
         """Smooth the position using a moving average filter."""
@@ -95,14 +114,23 @@ class BallTracker:
 
     def run(self):
         """Main loop for real-time ball tracking."""
-        rate = rospy.Rate(60)  # Higher frame rate
+        rate = rospy.Rate(60)  # Target processing rate
 
         while not rospy.is_shutdown():
-            # --- Option A: convert RGB (from Picamera2) to BGR once and keep the rest the same ---
+            # Capture RGB frame
             frame_rgb = self.picam2.capture_array()
-            frame = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
 
-            position, processed_frame = self.detect_ball(frame)
+            # Fix #1: Avoid extra conversions.
+            # - For detection: convert RGB -> HSV
+            hsv = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2HSV)
+
+            # - For display: only convert to BGR if visual_display is on
+            if self.visual_display:
+                frame_for_display = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+            else:
+                frame_for_display = frame_rgb  # won't be shown; passed through for API consistency
+
+            position, processed_frame = self.detect_ball(hsv, frame_for_display)
 
             if position:
                 smoothed_position = self.apply_moving_average(position)
@@ -117,10 +145,8 @@ class BallTracker:
                 self.ball_pub.publish(msg)
                 # rospy.loginfo(f"Published: {msg}")
 
-                if self.visual_display == True:
-                    # Draw the detected ball and velocity vector
-                    cv2.namedWindow("Ball Tracker", cv2.WINDOW_NORMAL)  # Allow resizing
-                    cv2.resizeWindow("Ball Tracker", 700, 700)
+                if self.visual_display:
+                    # Draw overlays on the BGR frame
                     cv2.circle(processed_frame, smoothed_position, 5, (0, 255, 0), -1)
                     text = f"Pos: {smoothed_position}, Vel: ({vx:.2f}, {vy:.2f})"
                     cv2.putText(processed_frame, text, (10, 30),
