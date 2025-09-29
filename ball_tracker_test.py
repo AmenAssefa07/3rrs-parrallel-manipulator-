@@ -1,144 +1,209 @@
 #!/usr/bin/env python3
-# TODOs (known issues not yet fixed):
-# 1) NoIR camera white balance / color gains not handled (colors can drift). Consider setting AwbMode/ColourGains.
-# 2) Log spam: "No ball detected" every cycle. Use rospy.logwarn_throttle to reduce noise.
-# 3) OpenCV window is created/resized every frame. Create once before the loop for efficiency.
-# 4) Camera is not explicitly stopped on shutdown. Add self.picam2.stop() in a finally/on_shutdown.
-# 5) Velocity can spike on tiny dt / jitter. Add dt floor and/or smooth vx, vy.
-# 6) Using Vector3 with speed in z is ambiguous. Consider publishing separate position/velocity topics or a custom msg.
-# 7) No morphological cleanup on mask. Add OPEN/CLOSE to reduce speckles/holes.
-# 8) Fixed radius threshold may fail at different scales. Consider area/circularity checks or adaptive thresholds.
-# 9) Frame rate request may not be honored as-is. Verify with proper sensor mode / FrameDurationLimits.
-# 10) No warm-up after camera start for AWB/exposure. Sleep briefly so stats settle.
-# 11) apply_moving_average casts via int(), which floors. Consider round() for less bias.
-# 12) Robustness: guard against None/invalid frames from capture_array().
-
 import rospy
 import cv2
 import numpy as np
 from picamera2 import Picamera2
 from geometry_msgs.msg import Vector3
-from collections import deque
 
 class BallTracker:
     def __init__(self):
-        rospy.init_node('ball_tracker', anonymous=True)
-
-        # Publisher for ball position and velocity
-        self.ball_pub = rospy.Publisher('/ball_position', Vector3, queue_size=1)
-
-        # Initialize Picamera2 with error handling
-        self.picam2 = Picamera2()
-        try:
-            camera_config = self.picam2.create_preview_configuration(
-                main={"size": (1000, 1000)},
-                controls={"FrameRate": 120}
-            )
-            self.picam2.configure(camera_config)
-            self.picam2.start()
-            rospy.loginfo("Camera initialized successfully.")
-        except Exception as e:
-            rospy.logerr(f"Camera initialization failed: {e}")
-            exit(1)
-
-        # State variables
-        self.prev_position = None
+        rospy.init_node('ball_tracker', log_level=rospy.INFO)
+        
+        # Configuration parameters
+        self.visual_display = True
+        self.show_hsv_mask = True
+        self.resolution = (640, 480)
+        
+        # HSV calibration parameters (initial values)
+        self.hsv_lower1 = np.array([0, 120, 70])
+        self.hsv_upper1 = np.array([10, 255, 255])
+        self.hsv_lower2 = np.array([170, 120, 70])
+        self.hsv_upper2 = np.array([180, 255, 255])
+        
+        # Camera initialization
+        self.camera = Picamera2()
+        config = self.camera.create_video_configuration(
+            main={"size": self.resolution, "format": "RGB888"},
+            controls={"FrameDurationLimits": (8333, 8333)}  # 120 FPS
+        )
+        self.camera.configure(config)
+        self.camera.start()
+        
+        # ROS publisher
+        self.pub = rospy.Publisher('/ball_data', Vector3, queue_size=1)
+        
+        # Tracking variables
+        self.prev_pos = None
         self.prev_time = rospy.Time.now()
-        self.position_history = deque(maxlen=5)
+        self.kalman = cv2.KalmanFilter(4, 2)
+        self._init_kalman()
+        
+        # Initialize debug windows if enabled
+        if self.visual_display:
+            self._init_debug_windows()
 
-        # Control display
-        self.visual_display = False  # Toggle to enable/disable display
-        rospy.loginfo(f"Display: {self.visual_display}")
+    def _init_kalman(self):
+        """Initialize Kalman filter matrices"""
+        self.kalman.measurementMatrix = np.array([[1,0,0,0],[0,1,0,0]], np.float32)
+        self.kalman.transitionMatrix = np.array([
+            [1,0,1,0],
+            [0,1,0,1],
+            [0,0,1,0],
+            [0,0,0,1]
+        ], np.float32)
+        self.kalman.processNoiseCov = 1e-4 * np.eye(4, dtype=np.float32)
+        self.kalman.measurementNoiseCov = 1e-2 * np.eye(2, dtype=np.float32)
 
-    def detect_ball(self, frame_bgr):
-        """Detect the ball using HSV color segmentation (two red ranges wrapping hue seam)."""
-        hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    def _init_debug_windows(self):
+        """Create debug windows and trackbars"""
+        cv2.namedWindow("Ball Tracker", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("Ball Tracker", 700, 700)
+        cv2.namedWindow("HSV Calibration")
+        
+        # Create trackbars for HSV calibration
+        cv2.createTrackbar("H1", "HSV Calibration", 0, 180, lambda x: None)
+        cv2.createTrackbar("S1", "HSV Calibration", 120, 255, lambda x: None)
+        cv2.createTrackbar("V1", "HSV Calibration", 70, 255, lambda x: None)
+        cv2.createTrackbar("H2", "HSV Calibration", 170, 180, lambda x: None)
+        cv2.createTrackbar("S2", "HSV Calibration", 120, 255, lambda x: None)
+        cv2.createTrackbar("V2", "HSV Calibration", 70, 255, lambda x: None)
+        
+        # Set initial trackbar positions
+        cv2.setTrackbarPos("H1", "HSV Calibration", 0)
+        cv2.setTrackbarPos("S1", "HSV Calibration", 120)
+        cv2.setTrackbarPos("V1", "HSV Calibration", 70)
+        cv2.setTrackbarPos("H2", "HSV Calibration", 170)
+        cv2.setTrackbarPos("S2", "HSV Calibration", 120)
+        cv2.setTrackbarPos("V2", "HSV Calibration", 70)
 
-        # Two-range red mask (example defaults; tune for your lighting/camera)
-        lower1 = np.array([0, 120, 80], dtype=np.uint8)
-        upper1 = np.array([10, 255, 255], dtype=np.uint8)
-        lower2 = np.array([170, 120, 80], dtype=np.uint8)
-        upper2 = np.array([180, 255, 255], dtype=np.uint8)
+    def _update_hsv_values(self):
+        """Update HSV values from trackbars"""
+        self.hsv_lower1 = np.array([
+            cv2.getTrackbarPos("H1", "HSV Calibration"),
+            cv2.getTrackbarPos("S1", "HSV Calibration"),
+            cv2.getTrackbarPos("V1", "HSV Calibration")
+        ])
+        self.hsv_upper2 = np.array([
+            cv2.getTrackbarPos("H2", "HSV Calibration"),
+            255,
+            255
+        ])
 
-        mask1 = cv2.inRange(hsv, lower1, upper1)
-        mask2 = cv2.inRange(hsv, lower2, upper2)
-        mask = cv2.bitwise_or(mask1, mask2)
+    def _process_mask(self, mask):
+        """Clean up detection mask with morphological operations"""
+        kernel = np.ones((5,5), np.uint8)
+        mask = cv2.erode(mask, kernel, iterations=1)
+        mask = cv2.dilate(mask, kernel, iterations=2)
+        return mask
 
-        contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-        if contours:
-            c = max(contours, key=cv2.contourArea)
-            (x, y), radius = cv2.minEnclosingCircle(c)
-            if radius > 10:
-                # rospy.loginfo(f"Ball detected at: {int(x)}, {int(y)} with radius: {radius}")
-                return (int(x), int(y)), frame_bgr
-        rospy.logwarn("No ball detected.")
-        return None, frame_bgr
-
-    def apply_moving_average(self, position):
-        """Smooth the position using a moving average filter."""
-        self.position_history.append(position)
-        avg = np.mean(self.position_history, axis=0)
-        return int(avg[0]), int(avg[1])
-
-    def calculate_velocity(self, position):
-        """Calculate the velocity vector."""
-        now = rospy.Time.now()
-        dt = (now - self.prev_time).to_sec()
-        if self.prev_position and dt > 0:
-            vx = (position[0] - self.prev_position[0]) / dt
-            vy = (position[1] - self.prev_position[1]) / dt
-        else:
-            vx, vy = 0.0, 0.0
-
-        self.prev_position, self.prev_time = position, now
-        return vx, vy
+    def _detect_ball(self, frame):
+        """Main detection pipeline"""
+        hsv = cv2.cvtColor(frame, cv2.COLOR_RGB2HSV)
+        
+        # Update HSV values from trackbars
+        if self.visual_display:
+            self._update_hsv_values()
+        
+        # Create HSV masks
+        mask1 = cv2.inRange(hsv, self.hsv_lower1, self.hsv_upper1)
+        mask2 = cv2.inRange(hsv, self.hsv_lower2, self.hsv_upper2)
+        combined_mask = cv2.bitwise_or(mask1, mask2)
+        processed_mask = self._process_mask(combined_mask)
+        
+        # Show HSV mask if enabled
+        if self.visual_display and self.show_hsv_mask:
+            cv2.imshow("HSV Mask", processed_mask)
+        
+        # Find and filter contours
+        contours, _ = cv2.findContours(processed_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_TC89_L1)
+        valid_contours = []
+        
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if 500 < area < 10000:
+                perimeter = cv2.arcLength(cnt, True)
+                if perimeter == 0:
+                    continue
+                circularity = 4 * np.pi * area / (perimeter ** 2)
+                if circularity > 0.6:
+                    valid_contours.append(cnt)
+        
+        if not valid_contours:
+            return None
+            
+        # Find largest valid contour
+        largest_contour = max(valid_contours, key=cv2.contourArea)
+        (x, y), radius = cv2.minEnclosingCircle(largest_contour)
+        return (int(x), int(y), int(radius))
 
     def run(self):
-        """Main loop for real-time ball tracking."""
-        rate = rospy.Rate(60)  # Higher frame rate
-
-        while not rospy.is_shutdown():
-            # --- Option A: convert RGB (from Picamera2) to BGR once and keep the rest the same ---
-            frame_rgb = self.picam2.capture_array()
-            frame = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-
-            position, processed_frame = self.detect_ball(frame)
-
-            if position:
-                smoothed_position = self.apply_moving_average(position)
-                vx, vy = self.calculate_velocity(smoothed_position)
-
-                # Publish position and velocity
-                msg = Vector3(
-                    x=smoothed_position[0],
-                    y=smoothed_position[1],
-                    z=np.hypot(vx, vy)
-                )
-                self.ball_pub.publish(msg)
-                # rospy.loginfo(f"Published: {msg}")
-
-                if self.visual_display == True:
-                    # Draw the detected ball and velocity vector
-                    cv2.namedWindow("Ball Tracker", cv2.WINDOW_NORMAL)  # Allow resizing
-                    cv2.resizeWindow("Ball Tracker", 700, 700)
-                    cv2.circle(processed_frame, smoothed_position, 5, (0, 255, 0), -1)
-                    text = f"Pos: {smoothed_position}, Vel: ({vx:.2f}, {vy:.2f})"
-                    cv2.putText(processed_frame, text, (10, 30),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-
-                    # Show the frame
+        """Main processing loop"""
+        try:
+            while not rospy.is_shutdown():
+                # Capture frame
+                frame = self.camera.capture_array()
+                current_time = rospy.Time.now()
+                
+                # Process detection
+                detection = self._detect_ball(frame)
+                processed_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR) if self.visual_display else None
+                
+                if detection:
+                    x, y, radius = detection
+                    
+                    # Kalman filter update
+                    prediction = self.kalman.predict()
+                    measured = np.array([[x], [y]], dtype=np.float32)
+                    state = self.kalman.correct(measured)
+                    
+                    # Calculate velocity
+                    dt = (current_time - self.prev_time).to_sec()
+                    if self.prev_pos and dt > 0:
+                        vx = (state[0][0] - self.prev_pos[0]) / dt
+                        vy = (state[1][0] - self.prev_pos[1]) / dt
+                    else:
+                        vx, vy = 0.0, 0.0
+                    
+                    speed = np.hypot(vx, vy)
+                    
+                    # Update previous values
+                    self.prev_pos = (state[0][0], state[1][0])
+                    self.prev_time = current_time
+                    
+                    # Publish data
+                    msg = Vector3()
+                    msg.x = state[0][0]
+                    msg.y = state[1][0]
+                    msg.z = speed
+                    self.pub.publish(msg)
+                    
+                    # Update debug display
+                    if self.visual_display:
+                        cv2.circle(processed_frame, (int(state[0][0]), int(state[1][0])), 
+                                  5, (0, 255, 0), -1)
+                        cv2.putText(processed_frame,
+                                  f"Pos: ({state[0][0]:.1f}, {state[1][0]:.1f}) Vel: ({vx:.1f}, {vy:.1f})",
+                                  (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                else:
+                    self._init_kalman()
+                    self.prev_pos = None
+                
+                # Handle display
+                if self.visual_display:
                     cv2.imshow("Ball Tracker", processed_frame)
-                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == ord('q'):
                         rospy.loginfo("Exiting visual display.")
                         break
-
-            rate.sleep()
-
-        cv2.destroyAllWindows()
+        
+        finally:
+            cv2.destroyAllWindows()
+            self.camera.stop()
+            rospy.loginfo("Camera resources released.")
 
 if __name__ == '__main__':
+    tracker = BallTracker()
     try:
-        tracker = BallTracker()
         tracker.run()
     except rospy.ROSInterruptException:
         pass
